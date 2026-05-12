@@ -1,0 +1,314 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+import json
+import os
+from datetime import datetime, date
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich import box
+
+console = Console()
+
+# --- CONFIGURATION ---
+LOGIN    = xxxxxxx
+PASSWORD = "xxxxxxx"
+SERVER   = "MetaQuotes-Demo"
+
+OBJECTIF_JOUR_PC = 0.5
+RISQUE_TRADE_PC  = 1.0
+MAX_TRADES_JOUR  = 4
+MAX_TRADES_PAIRE = 1
+STOP_PERTE_JOUR  = -1.5
+ATR_MULT         = 1.5
+RR_RATIO         = 2.0
+SLEEP_SEC        = 60
+MAGIC            = 777888
+
+TF_H1  = mt5.TIMEFRAME_H1
+TF_M15 = mt5.TIMEFRAME_M15
+
+SESSIONS = {
+    "Sydney" : (21, 6),
+    "Tokyo"  : (0,  9),
+    "Londres": (7, 16),
+    "NewYork": (12, 21),
+}
+
+PAIRES_SYDNEY  = ["AUDUSD", "NZDUSD", "AUDNZD", "AUDCAD", "NZDCAD"]
+PAIRES_TOKYO   = ["USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "NZDJPY"]
+PAIRES_LONDRES = ["EURUSD", "GBPUSD", "EURGBP", "GBPCHF", "EURCAD"]
+PAIRES_NEWYORK = ["USDCAD", "USDCHF", "EURUSD", "GBPUSD", "USDJPY"]
+
+PAIRES_ORIGINAL = [
+    "AUDJPY", "AUDNZD", "AUDUSD", "CADCHF", "CADJPY",
+    "CHFJPY", "EURJPY", "EURCAD", "EURNZD", "EURAUD",
+    "EURCZK", "NZDUSD", "USDCAD", "USDJPY", "EURCHF",
+    "GBPJPY"
+]
+
+ALL_SYMBOLS = list(set(PAIRES_ORIGINAL + PAIRES_SYDNEY + PAIRES_TOKYO + PAIRES_LONDRES + PAIRES_NEWYORK))
+PAIRES_JPY = {s for s in ALL_SYMBOLS if "JPY" in s}
+
+EMA_FAST       = 9
+EMA_SLOW       = 21
+RSI_PERIOD     = 14
+ATR_PERIOD     = 14
+BB_PERIOD      = 20
+BB_STD         = 2.0
+EMA_SCALP_FAST = 5
+EMA_SCALP_SLOW = 13
+
+JOURNAL_FILE = "journal_rachel_v2.json"
+
+# --- FONCTIONS UTILITAIRES ---
+
+def session_active():
+    h = datetime.utcnow().hour
+    actives = []
+    for name, (start, end) in SESSIONS.items():
+        if start < end:
+            if start <= h < end: actives.append(name)
+        else:
+            if h >= start or h < end: actives.append(name)
+    return actives
+
+def paires_session():
+    actives = session_active()
+    paires = set(PAIRES_ORIGINAL)
+    if "Sydney" in actives: paires.update(PAIRES_SYDNEY)
+    if "Tokyo" in actives: paires.update(PAIRES_TOKYO)
+    if "Londres" in actives: paires.update(PAIRES_LONDRES)
+    if "NewYork" in actives: paires.update(PAIRES_NEWYORK)
+    return list(paires)
+
+def charger_journal():
+    aujourd_hui = str(date.today())
+    if os.path.exists(JOURNAL_FILE):
+        with open(JOURNAL_FILE, "r") as f:
+            data = json.load(f)
+            if data.get("date") == aujourd_hui:
+                return data
+    journal = {
+        "date": aujourd_hui,
+        "trades_jour": 0,
+        "gain_jour_eur": 0.0,
+        "bot_actif": True,
+        "historique": []
+    }
+    sauvegarder_journal(journal)
+    return journal
+
+def sauvegarder_journal(j):
+    with open(JOURNAL_FILE, "w") as f:
+        json.dump(j, f, indent=2, ensure_ascii=False)
+
+def connecter_mt5():
+    if not mt5.initialize():
+        console.print("[red]Erreur MT5[/]")
+        return False
+    if not mt5.login(LOGIN, password=PASSWORD, server=SERVER):
+        console.print("[red]Login echoue[/]")
+        mt5.shutdown()
+        return False
+    acc = mt5.account_info()
+    console.print(f"[green]Connectee ! Bonjour Rachel | Balance : {acc.balance} {acc.currency}[/]")
+    return True
+
+# --- ANALYSE ET INDICATEURS ---
+
+def get_donnees(symbol, timeframe=TF_H1, nb=200):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, nb)
+    if rates is None or len(rates) < 50:
+        return None
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.set_index("time", inplace=True)
+    return df
+
+def calculer_indicateurs(df):
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_g = gain.ewm(com=RSI_PERIOD-1, min_periods=RSI_PERIOD).mean()
+    avg_l = loss.ewm(com=RSI_PERIOD-1, min_periods=RSI_PERIOD).mean()
+    df["rsi"] = 100 - (100 / (1 + avg_g / avg_l))
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+    df["ema_signal"] = np.where(df["ema_fast"] > df["ema_slow"], 1, -1)
+    df["croisement"] = df["ema_signal"].diff()
+    df["bb_mid"] = df["close"].rolling(BB_PERIOD).mean()
+    bb_std_val = df["close"].rolling(BB_PERIOD).std()
+    df["bb_upper"] = df["bb_mid"] + BB_STD * bb_std_val
+    df["bb_lower"] = df["bb_mid"] - BB_STD * bb_std_val
+    df["ema_s_fast"] = df["close"].ewm(span=EMA_SCALP_FAST, adjust=False).mean()
+    df["ema_s_slow"] = df["close"].ewm(span=EMA_SCALP_SLOW, adjust=False).mean()
+    df["scalp_signal"] = np.where(df["ema_s_fast"] > df["ema_s_slow"], 1, -1)
+    df["scalp_cross"] = df["scalp_signal"].diff()
+    return df
+
+# --- STRATEGIES ---
+
+def get_signal_ema_rsi(df):
+    row = df.iloc[-2]
+    rsi, cr, atr = row["rsi"], row["croisement"], row["atr"]
+    if cr > 0 and 50 < rsi < 70: return "BUY", rsi, atr, "EMA+RSI"
+    elif cr < 0 and 30 < rsi < 50: return "SELL", rsi, atr, "EMA+RSI"
+    return None, rsi, atr, "EMA+RSI"
+
+def get_signal_bollinger(df):
+    row = df.iloc[-2]; rsi = row["rsi"]; atr = row["atr"]
+    prix = row["close"]; bb_l = row["bb_lower"]; bb_u = row["bb_upper"]
+    if prix <= bb_l and rsi < 35: return "BUY", rsi, atr, "BB+RSI"
+    elif prix >= bb_u and rsi > 65: return "SELL", rsi, atr, "BB+RSI"
+    return None, rsi, atr, "BB+RSI"
+
+def get_signal_scalping(df):
+    row = df.iloc[-2]; rsi, cr, atr = row["rsi"], row["scalp_cross"], row["atr"]
+    if cr > 0 and rsi > 50: return "BUY", rsi, atr, "SCALP"
+    elif cr < 0 and rsi < 50: return "SELL", rsi, atr, "SCALP"
+    return None, rsi, atr, "SCALP"
+
+def get_meilleur_signal(df):
+    s1, r1, a1, n1 = get_signal_ema_rsi(df)
+    s2, r2, a2, n2 = get_signal_bollinger(df)
+    s3, r3, a3, n3 = get_signal_scalping(df)
+    sigs = [s for s in [s1, s2, s3] if s is not None]
+    if sigs.count("BUY") >= 2: return "BUY", r1, a1, "MULTI-STRAT"
+    if sigs.count("SELL") >= 2: return "SELL", r1, a1, "MULTI-STRAT"
+    if s1: return s1, r1, a1, n1
+    if s2: return s2, r2, a2, n2
+    if s3: return s3, r3, a3, n3
+    return None, r1, a1, "—"
+
+# --- EXECUTION TRADES ---
+
+def calculer_lot(symbol, sl_points):
+    acc = mt5.account_info(); sym = mt5.symbol_info(symbol)
+    risque = acc.balance * (RISQUE_TRADE_PC / 100)
+    val_pt = sym.trade_tick_value
+    if sl_points == 0: return sym.volume_min
+    lot = risque / (sl_points * val_pt)
+    step = sym.volume_step
+    lot = round(max(sym.volume_min, min(sym.volume_max, lot // step * step)), 2)
+    return lot
+
+def envoyer_ordre(symbol, signal, atr):
+    tick = mt5.symbol_info_tick(symbol); sym = mt5.symbol_info(symbol)
+    pt = sym.point; dig = sym.digits; sl_d = ATR_MULT * atr
+    tp_d = sl_d * RR_RATIO; sl_pts = sl_d / pt
+    if signal == "BUY":
+        prix = tick.ask; sl = round(prix - sl_d, dig); tp = round(prix + tp_d, dig); otype = mt5.ORDER_TYPE_BUY
+    else:
+        prix = tick.bid; sl = round(prix + sl_d, dig); tp = round(prix - tp_d, dig); otype = mt5.ORDER_TYPE_SELL
+    lot = calculer_lot(symbol, sl_pts)
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": lot,
+        "type": otype, "price": prix, "sl": sl, "tp": tp,
+        "deviation": 20, "magic": MAGIC, "comment": "Rachel Bot V2",
+        "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    res = mt5.order_send(req)
+    if res.retcode == mt5.TRADE_RETCODE_DONE: return True, res.order, lot, prix, sl, tp
+    return False, res.retcode, 0, 0, 0, 0
+
+def trades_ouverts(symbol):
+    pos = mt5.positions_get(symbol=symbol)
+    return sum(1 for p in (pos or []) if p.magic == MAGIC)
+
+def get_positions():
+    pos = mt5.positions_get()
+    return [p for p in (pos or []) if p.magic == MAGIC]
+
+# --- DASHBOARD ---
+
+def build_dashboard(etats, compte, journal, logs, sessions_actives, paires_actives):
+    layout = Layout()
+    layout.split_column(Layout(name="header", size=7), Layout(name="body"), Layout(name="log", size=10))
+    layout["body"].split_row(Layout(name="signaux", ratio=3), Layout(name="positions", ratio=2))
+
+    bal = compte["balance"]; eq = compte["equity"]; prof = compte["profit"]
+    p_col = "green" if prof >= 0 else "red"
+    obj_eur = bal * (OBJECTIF_JOUR_PC / 100)
+    gain_j = journal["gain_jour_eur"]
+    pct = min(100, (gain_j / obj_eur * 100)) if obj_eur > 0 else 0
+    barre = "#" * int(pct / 5) + "." * (20 - int(pct / 5))
+    
+    header = (
+        f"[bold cyan]BOT RACHEL V2 | {datetime.now().strftime('%H:%M:%S')}[/] Statut: {'[green]ACTIF[/]' if journal['bot_actif'] else '[red]STOP[/]'}\n"
+        f"Balance: {bal} | Equity: {eq} | P&L: [{p_col}]{prof}[/] | Trades: {journal['trades_jour']}/{MAX_TRADES_JOUR}\n"
+        f"Sessions: {', '.join(sessions_actives)} | Paires: {len(paires_actives)}\n"
+        f"Objectif: {round(obj_eur,2)} EUR | Realise: {round(gain_j,2)} EUR [{barre}] {round(pct)}%"
+    )
+    layout["header"].update(Panel(header, border_style="cyan"))
+
+    tbl = Table(title="Signaux", box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    tbl.add_column("Paire"); tbl.add_column("Prix"); tbl.add_column("RSI"); tbl.add_column("Signal"); tbl.add_column("Strat")
+    for s, e in sorted(etats.items()):
+        if not e: continue
+        sig = f"[bold green]BUY[/]" if e['signal']=="BUY" else f"[bold red]SELL[/]" if e['signal']=="SELL" else "---"
+        tbl.add_row(s, str(round(e['prix'], 5)), str(round(e['rsi'], 1)), sig, e['strategie'])
+    layout["signaux"].update(Panel(tbl))
+
+    pos_tbl = Table(title="Positions")
+    pos_tbl.add_column("Paire"); pos_tbl.add_column("P&L")
+    for p in get_positions():
+        pos_tbl.add_row(p.symbol, f"{round(p.profit, 2)} EUR")
+    layout["positions"].update(Panel(pos_tbl))
+
+    log_txt = "\n".join(logs[-6:])
+    layout["log"].update(Panel(log_txt, title="Logs"))
+    return layout
+
+# --- MAIN LOOP ---
+
+def run_bot():
+    if not connecter_mt5(): return
+    for sym in ALL_SYMBOLS: mt5.symbol_select(sym, True)
+    
+    journal = charger_journal()
+    logs = ["Bot Rachel V2 pret."]
+    etats = {s: {} for s in ALL_SYMBOLS}
+
+    with Live(console=console, refresh_per_second=1, screen=True) as live:
+        while True:
+            acc = mt5.account_info()
+            compte = {"balance": acc.balance, "equity": acc.equity, "profit": acc.profit}
+            sess_act = session_active()
+            pair_act = paires_session()
+
+            if journal["bot_actif"] and journal["trades_jour"] < MAX_TRADES_JOUR:
+                for symbol in pair_act:
+                    df = get_donnees(symbol)
+                    if df is None: continue
+                    df = calculer_indicateurs(df)
+                    sig, rsi, atr, strat = get_meilleur_signal(df)
+                    tick = mt5.symbol_info_tick(symbol)
+                    etats[symbol] = {"prix": tick.bid, "rsi": rsi, "signal": sig, "strategie": strat}
+
+                    if sig and trades_ouverts(symbol) < MAX_TRADES_PAIRE:
+                        ok, _, lot, _, _, _ = envoyer_ordre(symbol, sig, atr)
+                        if ok:
+                            journal["trades_jour"] += 1
+                            sauvegarder_journal(journal)
+                            logs.append(f"{symbol} {sig} execute (Lot {lot})")
+
+            live.update(build_dashboard(etats, compte, journal, logs, sess_act, pair_act))
+            time.sleep(SLEEP_SEC)
+
+if __name__ == "__main__":
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Arret...[/]")
+    finally:
+        mt5.shutdown()

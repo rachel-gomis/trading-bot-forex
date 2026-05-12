@@ -1,12 +1,12 @@
-#  Automated Forex Trading Bot — Python & MetaTrader 5
+#  Automated Forex Trading Bot with Python & MetaTrader 5
 
 Automated trading bot developed in Python, connected to MetaTrader 5.
 Trades across multiple Forex pairs using combined quantitative strategies.
 
 ##  Strategies
 
-- **EMA + RSI** — trend following with momentum confirmation
-- **Bollinger Bands + RSI** — mean reversion on volatility breakouts
+- **EMA + RSI** trend following with momentum confirmation
+- **Bollinger Bands + RSI**  mean reversion on volatility breakouts
 - **Scalping EMA 5/13** — short-term entries on fast crossovers
 
 ##  Traded Pairs
@@ -22,7 +22,7 @@ EUR/USD, GBP/USD, USD/JPY *(and others depending on session)*
 
 ##  Tech Stack
 
-- Python 3.x
+- Python 3.xx
 - MetaTrader 5 API
 - pandas, numpy
 - RSI, EMA, MACD indicators
@@ -30,5 +30,5 @@ EUR/USD, GBP/USD, USD/JPY *(and others depending on session)*
 ##  Objective
 
 Personal project to apply quantitative finance concepts
-and automate market analysis — developed alongside
+and automate market analysis developed alongside
 a Bachelor in Finance de Marché at ESLSCA Business School Paris.
